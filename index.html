@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stardust Solitude - Aurum</title>
+
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+
+    <!-- Three.js and Post-Processing Dependencies -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+
+    <!-- Bloom Pass Dependencies -->
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+
+    <!-- OrbitControls -->
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #030308;
+            font-family: 'Inter', sans-serif;
+            user-select: none;
+        }
+
+        #webgl-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Three.js Canvas -->
+    <canvas id="webgl-canvas"></canvas>
+
+    <!-- GLSL Shaders & Application Logic -->
+    <script>
+        // 4000颗星星：细腻、低亮、柔和缓慢闪烁
+        const starVertexShader = `
+            uniform float uTime;
+            uniform float uPixelRatio;
+
+            attribute float aSize;
+            attribute float aPhase;
+            attribute float aAlpha;
+
+            varying vec3 vColor;
+            varying float vAlpha;
+
+            void main() {
+                vColor = color;
+                
+                float twinkle = 0.75 + 0.25 * sin(uTime * 0.9 + aPhase);
+                vAlpha = aAlpha * twinkle;
+
+                vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                gl_Position = projectionMatrix * mvPosition;
+
+                gl_PointSize = aSize * uPixelRatio * (180.0 / -mvPosition.z);
+            }
+        `;
+
+        const starFragmentShader = `
+            varying vec3 vColor;
+            varying float vAlpha;
+
+            void main() {
+                vec2 coord = gl_PointCoord - vec2(0.5);
+                float dist = length(coord);
+                if (dist > 0.5) discard;
+
+                float alphaGlow = exp(-6.0 * dist * dist) * vAlpha;
+                gl_FragColor = vec4(vColor, alphaGlow);
+            }
+        `;
+
+        const particleVertexShader = `
+            uniform float uTime;
+            uniform float uScale;
+            uniform float uChaos;
+            uniform float uPointSize;
+            uniform vec3 uSunDirection;
+            
+            attribute float aSize;
+            attribute vec3 aColor;
+            attribute float aOrbitRadius;
+            attribute float aOrbitSpeed;
+            attribute float aInitialAngle;
+            attribute float aParticleType;
+            attribute vec3 aRandomNoiseSeed;
+            attribute vec3 aNormal;
+
+            varying vec3 vColor;
+            varying float vDistanceToCam;
+            varying float vType;
+            varying float vAlpha;
+            varying float vLightFactor;
+
+            vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec4 permute(vec4 x) { return mod289(((x*34.0)+1.0)*x); }
+            vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+
+            float snoise(vec3 v) {
+                const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+                const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+                vec3 i  = floor(v + dot(v, C.yyy));
+                vec3 x0 = v - i + dot(i, C.xxx);
+                vec3 g = step(x0.yzx, x0.xyz);
+                vec3 l = 1.0 - g;
+                vec3 i1 = min(g.xyz, l.zxy);
+                vec3 i2 = max(g.xyz, l.zxy);
+                vec3 x1 = x0 - i1 + C.xxx;
+                vec3 x2 = x0 - i2 + C.yyy;
+                vec3 x3 = x0 - D.yyy;
+                i = mod289(i);
+                vec4 p = permute(permute(permute(
+                            i.z + vec4(0.0, i1.z, i2.z, 1.0))
+                        + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+                        + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+                float n_ = 0.142857142857;
+                vec3 ns = n_ * D.wyz - D.xzx;
+                vec4 j = p - 49.0 * floor(p * ns.z);
+                vec4 x_ = floor(j * ns.z);
+                vec4 y_ = floor(j - 7.0 * x_);
+                vec4 x = x_ *ns.x + ns.yyyy;
+                vec4 y = y_ *ns.x + ns.yyyy;
+                vec4 h = 1.0 - abs(x) - abs(y);
+                vec4 b0 = vec4(x.xy, y.xy);
+                vec4 b1 = vec4(x.zw, y.zw);
+                vec4 s0 = floor(b0)*2.0 + 1.0;
+                vec4 s1 = floor(b1)*2.0 + 1.0;
+                vec4 sh = -step(h, vec4(0.0));
+                vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+                vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+                vec3 p0 = vec3(a0.xy, h.x);
+                vec3 p1 = vec3(a0.zw, h.y);
+                vec3 p2 = vec3(a1.xy, h.z);
+                vec3 p3 = vec3(a1.zw, h.w);
+                vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)));
+                p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+                vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+                m = m * m;
+                return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+            }
+
+            void main() {
+                vColor = aColor;
+                vType = aParticleType;
+                
+                vec3 currentPos = position;
+                vec3 norm = aNormal;
+
+                if (aParticleType > 0.5) {
+                    float angle = aInitialAngle + uTime * aOrbitSpeed * 0.35;
+                    currentPos.x = cos(angle) * aOrbitRadius;
+                    currentPos.z = sin(angle) * aOrbitRadius;
+                    norm = vec3(0.0, 1.0, 0.0);
+                } else {
+                    float globeAngle = uTime * 0.02;
+                    float cosA = cos(globeAngle);
+                    float sinA = sin(globeAngle);
+                    float nx = currentPos.x * cosA - currentPos.z * sinA;
+                    float nz = currentPos.x * sinA + currentPos.z * cosA;
+                    currentPos.x = nx;
+                    currentPos.z = nz;
+
+                    float nnx = norm.x * cosA - norm.z * sinA;
+                    float nnz = norm.x * sinA + norm.z * cosA;
+                    norm.x = nnx;
+                    norm.z = nnz;
+                }
+
+                if (aParticleType < 0.5) {
+                    float diffuse = max(dot(norm, uSunDirection), 0.0);
+                    vLightFactor = 0.75 + 0.35 * pow(diffuse, 1.1);
+                } else {
+                    vec3 sunDir = uSunDirection;
+                    float dotSun = max(dot(norm, sunDir), 0.0);
+                    vLightFactor = 0.80 + 0.25 * dotSun;
+                }
+
+                vec3 scaledPos = currentPos * uScale;
+
+                if (uChaos > 0.001) {
+                    float noiseTime = uTime * 2.8 + aRandomNoiseSeed.x * 100.0;
+                    vec3 noiseDir;
+                    noiseDir.x = snoise(vec3(scaledPos.x * 0.06, scaledPos.y * 0.06, noiseTime));
+                    noiseDir.y = snoise(vec3(scaledPos.y * 0.06, scaledPos.z * 0.06, noiseTime + 31.41));
+                    noiseDir.z = snoise(vec3(scaledPos.z * 0.06, scaledPos.x * 0.06, noiseTime + 62.83));
+
+                    vec3 jitter = vec3(
+                        sin(noiseTime * 10.0 + aRandomNoiseSeed.y * 40.0),
+                        cos(noiseTime * 11.0 + aRandomNoiseSeed.z * 40.0),
+                        sin(noiseTime * 12.0 + aRandomNoiseSeed.x * 40.0)
+                    ) * 0.18;
+
+                    float explosionStrength = pow(uChaos, 1.7) * 12.0;
+                    scaledPos += (noiseDir * 1.0 + jitter) * explosionStrength;
+                }
+
+                vec4 mvPosition = modelViewMatrix * vec4(scaledPos, 1.0);
+                gl_Position = projectionMatrix * mvPosition;
+
+                vDistanceToCam = -mvPosition.z;
+                
+                float baseSize = aSize * uPointSize;
+                float sizeFactor = (vType < 0.5) ? 0.55 : 0.50;
+                
+                gl_PointSize = clamp(baseSize * sizeFactor * (180.0 / vDistanceToCam), 0.5, 4.5);
+
+                vAlpha = smoothstep(0.1, 4.0, vDistanceToCam);
+            }
+        `;
+
+        const particleFragmentShader = `
+            uniform float uBrightness;
+            uniform float uChaos;
+
+            varying vec3 vColor;
+            varying float vDistanceToCam;
+            varying float vType;
+            varying float vAlpha;
+            varying float vLightFactor;
+
+            void main() {
+                vec2 coord = gl_PointCoord - vec2(0.5);
+                float dist = length(coord);
+                if (dist > 0.5) discard;
+
+                float glow = exp(-4.5 * dist * dist);
+
+                vec3 finalColor = vColor * vLightFactor * uBrightness * 0.82;
+
+                if (uChaos > 0.05) {
+                    finalColor += vec3(0.12, 0.08, 0.04) * pow(uChaos, 1.8);
+                }
+
+                float baseAlpha = (vType < 0.5) ? 0.70 : 0.55;
+                float alpha = glow * vAlpha * baseAlpha;
+
+                if (alpha < 0.04) discard;
+                
+                gl_FragColor = vec4(finalColor, alpha);
+            }
+        `;
+
+        const config = {
+            particleCountGlobe: 180000,
+            particleCountRings: 370000,
+            minScale: 0.45,
+            maxScale: 2.25,
+            baseBrightness: 0.95,
+            maxBrightness: 1.30,
+            bloomThreshold: 0.72,
+            bloomStrength: 0.20,
+            ringInnerRadius: 10.8,  
+            ringOuterRadius: 23.5, 
+            globeRadius: 7.4       
+        };
+
+        let scene, camera, renderer, composer, bloomPass;
+        let globeGeometry, globeMaterial, globeSystem;
+        let ringGeometry, ringMaterial, ringSystem;
+        let starMaterial, starSystem;
+        let particleSystem;
+        let controls;
+        let currentScale = 1.0;
+        let targetScale = 1.0;
+        let chaosLevel = 0.0;
+        let clock = new THREE.Clock();
+
+        function initScene() {
+            const container = document.getElementById('webgl-canvas');
+            
+            scene = new THREE.Scene();
+
+            camera = new THREE.PerspectiveCamera(42, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 16, 36);
+
+            renderer = new THREE.WebGLRenderer({
+                canvas: container,
+                antialias: true,
+                alpha: false,
+                powerPreference: "high-performance"
+            });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 0.85;
+
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.035;
+            controls.maxDistance = 120;
+            controls.minDistance = 6;
+
+            const renderScene = new THREE.RenderPass(scene, camera);
+            
+            bloomPass = new THREE.UnrealBloomPass(
+                new THREE.Vector2(window.innerWidth, window.innerHeight),
+                config.bloomStrength, 
+                0.35,                 
+                config.bloomThreshold 
+            );
+
+            composer = new THREE.EffectComposer(renderer);
+            composer.addPass(renderScene);
+            composer.addPass(bloomPass);
+
+            createSaturnParticles();
+            createBackgroundStars();
+
+            window.addEventListener('resize', onWindowResize);
+            setupFallbackInteractions();
+            
+            animate();
+        }
+
+        function createBackgroundStars() {
+            const count = 4000;
+            const positions = new Float32Array(count * 3);
+            const colors = new Float32Array(count * 3);
+            const sizes = new Float32Array(count);
+            const phases = new Float32Array(count);
+            const alphas = new Float32Array(count);
+
+            const palette = [
+                new THREE.Color(0xffffff),
+                new THREE.Color(0xdceaff),
+                new THREE.Color(0xfff4db),
+                new THREE.Color(0xd8c29d)
+            ];
+
+            for (let i = 0; i < count; i++) {
+                const r = 80 + Math.random() * 160;
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+
+                positions[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+                positions[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+                positions[i * 3 + 2] = r * Math.cos(phi);
+
+                const colorChoice = palette[Math.floor(Math.random() * palette.length)];
+                colors[i * 3] = colorChoice.r;
+                colors[i * 3 + 1] = colorChoice.g;
+                colors[i * 3 + 2] = colorChoice.b;
+
+                sizes[i] = 1.0 + Math.random() * 1.6;
+                phases[i] = Math.random() * Math.PI * 2.0;
+                alphas[i] = 0.22 + Math.random() * 0.25; 
+            }
+
+            const starGeo = new THREE.BufferGeometry();
+            starGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            starGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            starGeo.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
+            starGeo.setAttribute('aPhase', new THREE.BufferAttribute(phases, 1));
+            starGeo.setAttribute('aAlpha', new THREE.BufferAttribute(alphas, 1));
+
+            starMaterial = new THREE.ShaderMaterial({
+                vertexShader: starVertexShader,
+                fragmentShader: starFragmentShader,
+                uniforms: {
+                    uTime: { value: 0 },
+                    uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) }
+                },
+                vertexColors: true,
+                transparent: true,
+                depthWrite: false,
+                fog: false,
+                blending: THREE.AdditiveBlending
+            });
+
+            starSystem = new THREE.Points(starGeo, starMaterial);
+            scene.add(starSystem);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+
+            const pixelRatio = Math.min(window.devicePixelRatio, 2);
+            if (globeMaterial && ringMaterial) {
+                globeMaterial.uniforms.uPointSize.value = pixelRatio;
+                ringMaterial.uniforms.uPointSize.value = pixelRatio;
+            }
+            if (starMaterial) {
+                starMaterial.uniforms.uPixelRatio.value = pixelRatio;
+            }
+        }
+
+        function createSaturnParticles() {
+            const sunDir = new THREE.Vector3(0.6, 0.45, 0.65).normalize();
+
+            const colorGlobeDark = new THREE.Color(0xcfa052);    
+            const colorGlobeBand = new THREE.Color(0xf5d387);    
+            const colorGlobeLight = new THREE.Color(0xffebaf);   
+            
+            const colorRingC = new THREE.Color(0x9e7343);        
+            const colorRingBInner = new THREE.Color(0xf0c587);   
+            const colorRingBOuter = new THREE.Color(0xfce7b6);   
+            const colorCassini = new THREE.Color(0x1a1207);      
+            const colorRingA = new THREE.Color(0xd49b55);        
+
+            // 1. GLOBE SYSTEM SETUP
+            const globePos = new Float32Array(config.particleCountGlobe * 3);
+            const globeNorms = new Float32Array(config.particleCountGlobe * 3);
+            const globeCols = new Float32Array(config.particleCountGlobe * 3);
+            const globeSizes = new Float32Array(config.particleCountGlobe);
+            const globeRadii = new Float32Array(config.particleCountGlobe);
+            const globeSpeeds = new Float32Array(config.particleCountGlobe);
+            const globeAngles = new Float32Array(config.particleCountGlobe);
+            const globeTypes = new Float32Array(config.particleCountGlobe);
+            const globeNoise = new Float32Array(config.particleCountGlobe * 3);
+
+            for (let i = 0; i < config.particleCountGlobe; i++) {
+                const u = Math.random();
+                const v = Math.random();
+                const theta = u * 2.0 * Math.PI;
+                const phi = Math.acos(2.0 * v - 1.0);
+                
+                const r = config.globeRadius * (0.02 + 0.98 * Math.pow(Math.random(), 0.15));
+
+                const x = r * Math.sin(phi) * Math.cos(theta);
+                const y = r * Math.cos(phi) * 0.95; 
+                const z = r * Math.sin(phi) * Math.sin(theta);
+
+                globePos[i * 3] = x;
+                globePos[i * 3 + 1] = y;
+                globePos[i * 3 + 2] = z;
+
+                const normLen = Math.hypot(x, y / 0.95, z) || 1.0;
+                globeNorms[i * 3] = x / normLen;
+                globeNorms[i * 3 + 1] = (y / 0.95) / normLen;
+                globeNorms[i * 3 + 2] = z / normLen;
+
+                const latFactor = Math.abs(y / config.globeRadius);
+                const bandPattern = Math.sin(latFactor * Math.PI * 14.0) * 0.5 + 0.5;
+                const pColor = colorGlobeDark.clone().lerp(colorGlobeBand, bandPattern).lerp(colorGlobeLight, 0.4 - latFactor * 0.2);
+                
+                globeCols[i * 3] = pColor.r;
+                globeCols[i * 3 + 1] = pColor.g;
+                globeCols[i * 3 + 2] = pColor.b;
+
+                globeSizes[i] = 0.75 + Math.random() * 0.85;
+                globeRadii[i] = r;
+                globeSpeeds[i] = 0.04;
+                globeAngles[i] = theta;
+                globeTypes[i] = 0.0;
+
+                globeNoise[i * 3] = Math.random();
+                globeNoise[i * 3 + 1] = Math.random();
+                globeNoise[i * 3 + 2] = Math.random();
+            }
+
+            globeGeometry = new THREE.BufferGeometry();
+            globeGeometry.setAttribute('position', new THREE.BufferAttribute(globePos, 3));
+            globeGeometry.setAttribute('aNormal', new THREE.BufferAttribute(globeNorms, 3));
+            globeGeometry.setAttribute('aColor', new THREE.BufferAttribute(globeCols, 3));
+            globeGeometry.setAttribute('aSize', new THREE.BufferAttribute(globeSizes, 1));
+            globeGeometry.setAttribute('aOrbitRadius', new THREE.BufferAttribute(globeRadii, 1));
+            globeGeometry.setAttribute('aOrbitSpeed', new THREE.BufferAttribute(globeSpeeds, 1));
+            globeGeometry.setAttribute('aInitialAngle', new THREE.BufferAttribute(globeAngles, 1));
+            globeGeometry.setAttribute('aParticleType', new THREE.BufferAttribute(globeTypes, 1));
+            globeGeometry.setAttribute('aRandomNoiseSeed', new THREE.BufferAttribute(globeNoise, 3));
+
+            globeMaterial = new THREE.ShaderMaterial({
+                vertexShader: particleVertexShader,
+                fragmentShader: particleFragmentShader,
+                uniforms: {
+                    uTime: { value: 0 },
+                    uScale: { value: 1.0 },
+                    uChaos: { value: 0.0 },
+                    uPointSize: { value: window.devicePixelRatio },
+                    uBrightness: { value: config.baseBrightness },
+                    uSunDirection: { value: sunDir }
+                },
+                transparent: true,
+                depthWrite: true,
+                depthTest: true,
+                blending: THREE.NormalBlending
+            });
+
+            globeSystem = new THREE.Points(globeGeometry, globeMaterial);
+            globeSystem.renderOrder = 1;
+
+            // 2. RING SYSTEM SETUP
+            const ringPos = new Float32Array(config.particleCountRings * 3);
+            const ringNorms = new Float32Array(config.particleCountRings * 3);
+            const ringCols = new Float32Array(config.particleCountRings * 3);
+            const ringSizes = new Float32Array(config.particleCountRings);
+            const ringRadii = new Float32Array(config.particleCountRings);
+            const ringSpeeds = new Float32Array(config.particleCountRings);
+            const ringAngles = new Float32Array(config.particleCountRings);
+            const ringTypes = new Float32Array(config.particleCountRings);
+            const ringNoise = new Float32Array(config.particleCountRings * 3);
+
+            for (let i = 0; i < config.particleCountRings; i++) {
+                let r;
+                const ringRand = Math.random();
+                
+                if (ringRand < 0.15) {
+                    r = THREE.MathUtils.lerp(10.8, 13.5, Math.random());
+                } else if (ringRand < 0.58) {
+                    r = THREE.MathUtils.lerp(13.6, 17.2, Math.random());
+                } else if (ringRand < 0.65) {
+                    r = THREE.MathUtils.lerp(17.2, 18.2, Math.random());
+                } else if (ringRand < 0.94) {
+                    r = THREE.MathUtils.lerp(18.2, 22.8, Math.random());
+                } else {
+                    r = THREE.MathUtils.lerp(22.8, 23.5, Math.random());
+                }
+
+                const angle = Math.random() * Math.PI * 2.0;
+                const thickness = (1.0 - (r / config.ringOuterRadius)) * 0.12 + 0.02;
+                const y = (Math.random() - 0.5) * thickness;
+
+                ringPos[i * 3] = Math.cos(angle) * r;
+                ringPos[i * 3 + 1] = y;
+                ringPos[i * 3 + 2] = Math.sin(angle) * r;
+
+                ringNorms[i * 3] = 0.0;
+                ringNorms[i * 3 + 1] = 1.0;
+                ringNorms[i * 3 + 2] = 0.0;
+
+                let pColor;
+                if (r < 13.5) {
+                    pColor = colorRingC.clone().lerp(colorRingBInner, (r - 10.8) / 2.7);
+                } else if (r < 17.2) {
+                    pColor = colorRingBInner.clone().lerp(colorRingBOuter, (r - 13.6) / 3.6).multiplyScalar(0.88);
+                } else if (r < 18.2) {
+                    pColor = colorCassini;
+                } else if (Math.abs(r - 21.0) < 0.1) {
+                    pColor = colorCassini; 
+                } else {
+                    pColor = colorRingA.clone().lerp(colorRingC, (r - 18.2) / 5.3);
+                }
+
+                ringCols[i * 3] = pColor.r * (0.85 + Math.random() * 0.15);
+                ringCols[i * 3 + 1] = pColor.g * (0.85 + Math.random() * 0.15);
+                ringCols[i * 3 + 2] = pColor.b * (0.85 + Math.random() * 0.15);
+
+                ringSizes[i] = 0.60 + Math.random() * 0.85;
+                ringRadii[i] = r;
+                ringSpeeds[i] = 13.5 / Math.pow(r, 1.5);
+                ringAngles[i] = angle;
+                ringTypes[i] = 1.0;
+
+                ringNoise[i * 3] = Math.random();
+                ringNoise[i * 3 + 1] = Math.random();
+                ringNoise[i * 3 + 2] = Math.random();
+            }
+
+            ringGeometry = new THREE.BufferGeometry();
+            ringGeometry.setAttribute('position', new THREE.BufferAttribute(ringPos, 3));
+            ringGeometry.setAttribute('aNormal', new THREE.BufferAttribute(ringNorms, 3));
+            ringGeometry.setAttribute('aColor', new THREE.BufferAttribute(ringCols, 3));
+            ringGeometry.setAttribute('aSize', new THREE.BufferAttribute(ringSizes, 1));
+            ringGeometry.setAttribute('aOrbitRadius', new THREE.BufferAttribute(ringRadii, 1));
+            ringGeometry.setAttribute('aOrbitSpeed', new THREE.BufferAttribute(ringSpeeds, 1));
+            ringGeometry.setAttribute('aInitialAngle', new THREE.BufferAttribute(ringAngles, 1));
+            ringGeometry.setAttribute('aParticleType', new THREE.BufferAttribute(ringTypes, 1));
+            ringGeometry.setAttribute('aRandomNoiseSeed', new THREE.BufferAttribute(ringNoise, 3));
+
+            ringMaterial = new THREE.ShaderMaterial({
+                vertexShader: particleVertexShader,
+                fragmentShader: particleFragmentShader,
+                uniforms: {
+                    uTime: { value: 0 },
+                    uScale: { value: 1.0 },
+                    uChaos: { value: 0.0 },
+                    uPointSize: { value: window.devicePixelRatio },
+                    uBrightness: { value: config.baseBrightness },
+                    uSunDirection: { value: sunDir }
+                },
+                transparent: true,
+                depthWrite: true,
+                depthTest: true,
+                blending: THREE.NormalBlending
+            });
+
+            ringSystem = new THREE.Points(ringGeometry, ringMaterial);
+            ringSystem.renderOrder = 2;
+
+            particleSystem = new THREE.Group();
+            particleSystem.add(ringSystem);
+            particleSystem.add(globeSystem);
+            particleSystem.rotation.z = THREE.MathUtils.degToRad(26.73);
+            scene.add(particleSystem);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const elapsedTime = clock.getElapsedTime();
+
+            currentScale += (targetScale - currentScale) * 0.018;
+
+            const chaosThreshold = 1.75; 
+            if (currentScale > chaosThreshold) {
+                const progress = (currentScale - chaosThreshold) / (config.maxScale - chaosThreshold);
+                chaosLevel = Math.pow(Math.min(1.0, Math.max(0.0000, progress)), 1.5)/1000;
+            } else {
+                chaosLevel = 0.0000;
+            }
+
+            const dynamicBrightness = THREE.MathUtils.lerp(
+                config.baseBrightness,
+                config.maxBrightness,
+                (currentScale - config.minScale) / (config.maxScale - config.minScale)
+            );
+
+            if (globeMaterial && ringMaterial) {
+                globeMaterial.uniforms.uTime.value = elapsedTime;
+                globeMaterial.uniforms.uScale.value = currentScale;
+                globeMaterial.uniforms.uChaos.value = chaosLevel;
+                globeMaterial.uniforms.uBrightness.value = dynamicBrightness;
+
+                ringMaterial.uniforms.uTime.value = elapsedTime;
+                ringMaterial.uniforms.uScale.value = currentScale;
+                ringMaterial.uniforms.uChaos.value = chaosLevel;
+                ringMaterial.uniforms.uBrightness.value = dynamicBrightness;
+            }
+
+            if (starMaterial) {
+                starMaterial.uniforms.uTime.value = elapsedTime;
+            }
+
+            if (particleSystem) {
+                particleSystem.rotation.y = elapsedTime * 0.012;
+            }
+
+            controls.update();
+            composer.render();
+        }
+
+        function setupFallbackInteractions() {
+            window.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                const delta = e.deltaY * -0.0008;
+                targetScale = THREE.MathUtils.clamp(targetScale + delta, config.minScale, config.maxScale);
+            }, { passive: false });
+
+            let touchStartDist = 0;
+            window.addEventListener('touchstart', (e) => {
+                if (e.touches.length === 2) {
+                    touchStartDist = Math.hypot(
+                        e.touches[0].pageX - e.touches[1].pageX,
+                        e.touches[0].pageY - e.touches[1].pageY
+                    );
+                }
+            });
+
+            window.addEventListener('touchmove', (e) => {
+                if (e.touches.length === 2 && touchStartDist > 0) {
+                    const dist = Math.hypot(
+                        e.touches[0].pageX - e.touches[1].pageX,
+                        e.touches[0].pageY - e.touches[1].pageY
+                    );
+                    const delta = (dist - touchStartDist) * 0.003;
+                    targetScale = THREE.MathUtils.clamp(targetScale + delta, config.minScale, config.maxScale);
+                    touchStartDist = dist;
+                }
+            });
+        }
+
+        window.onload = function() {
+            initScene();
+        };
+    </script>
+</body>
+</html>
